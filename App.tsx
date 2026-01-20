@@ -8,6 +8,7 @@ import {
 import jsPDF from 'jspdf';
 import { AppView, Note, ProcessingStatus } from './types';
 import { transcribeAudio, summarizeText } from './services/ai';
+import { saveAudioLocal, getAudioLocal, deleteAudioLocal } from './services/storage';
 import { Button } from './components/Button';
 import { NoteCard } from './components/NoteCard';
 import { Waveform } from './components/Waveform';
@@ -39,23 +40,58 @@ const App: React.FC = () => {
   const audioChunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const wakeLockRef = useRef<any>(null);
+  const [activeStream, setActiveStream] = useState<MediaStream | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
 
+  // Efeito para carregar notas e restaurar URLs de áudio do IndexedDB
   useEffect(() => {
-    const saved = localStorage.getItem('voznote_data');
-    if (saved) {
-      try {
-        setNotes(JSON.parse(saved));
-      } catch (e) {
-        console.error("Erro ao carregar dados", e);
+    const loadData = async () => {
+      const saved = localStorage.getItem('voznote_data');
+      if (saved) {
+        try {
+          const parsedNotes: Note[] = JSON.parse(saved);
+          
+          // Tenta restaurar os áudios salvos localmente no banco de dados
+          const notesWithAudio = await Promise.all(parsedNotes.map(async (note) => {
+            const blob = await getAudioLocal(note.id);
+            if (blob) {
+              return { ...note, audioUrl: URL.createObjectURL(blob) };
+            }
+            return note;
+          }));
+          
+          setNotes(notesWithAudio);
+        } catch (e) {
+          console.error("Erro ao carregar dados", e);
+        }
       }
-    }
+    };
+    loadData();
   }, []);
 
+  // Salva apenas os metadados no localStorage
   useEffect(() => {
     const notesToSave = notes.map(({ audioUrl, ...rest }) => rest);
     localStorage.setItem('voznote_data', JSON.stringify(notesToSave));
   }, [notes]);
+
+  const requestWakeLock = async () => {
+    if ('wakeLock' in navigator) {
+      try {
+        wakeLockRef.current = await (navigator as any).wakeLock.request('screen');
+      } catch (err) {
+        console.warn('Wake Lock não suportado');
+      }
+    }
+  };
+
+  const releaseWakeLock = () => {
+    if (wakeLockRef.current) {
+      wakeLockRef.current.release();
+      wakeLockRef.current = null;
+    }
+  };
 
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
@@ -65,11 +101,13 @@ const App: React.FC = () => {
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      // Otimização de Bitrate para gravações longas (48kbps é excelente para voz e reduz tamanho do arquivo)
-      const mediaRecorder = new MediaRecorder(stream, {
-        audioBitsPerSecond: 48000
+      await requestWakeLock();
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } 
       });
+      
+      setActiveStream(stream);
+      const mediaRecorder = new MediaRecorder(stream, { audioBitsPerSecond: 48000 });
       mediaRecorderRef.current = mediaRecorder;
       audioChunksRef.current = [];
 
@@ -77,7 +115,7 @@ const App: React.FC = () => {
         if (e.data.size > 0) audioChunksRef.current.push(e.data);
       };
 
-      mediaRecorder.start();
+      mediaRecorder.start(1000);
       setIsRecording(true);
       setRecordingDuration(0);
       setView(AppView.RECORD);
@@ -86,39 +124,55 @@ const App: React.FC = () => {
         setRecordingDuration(p => p + 1);
       }, 1000);
     } catch (err) {
-      alert("Permissão de microfone necessária ou dispositivo não suportado.");
+      alert("Erro ao acessar microfone.");
+      releaseWakeLock();
     }
+  };
+
+  const cancelRecording = () => {
+    if (confirm("Deseja descartar a gravação atual?")) {
+      cleanupRecording();
+      setView(AppView.LIST);
+    }
+  };
+
+  const cleanupRecording = () => {
+    if (mediaRecorderRef.current) {
+      if (mediaRecorderRef.current.state !== 'inactive') mediaRecorderRef.current.stop();
+      mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop());
+    }
+    setActiveStream(null);
+    setIsRecording(false);
+    releaseWakeLock();
+    if (timerRef.current) clearInterval(timerRef.current);
   };
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-      if (timerRef.current) clearInterval(timerRef.current);
-
       mediaRecorderRef.current.onstop = async () => {
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         const audioUrl = URL.createObjectURL(audioBlob);
-        mediaRecorderRef.current?.stream.getTracks().forEach(t => t.stop());
         await processAudio(audioBlob, audioUrl);
       };
+      cleanupRecording();
     }
   };
 
   const processAudio = async (blob: Blob, audioUrl: string) => {
+    const noteId = Date.now().toString();
     setProcessingStatus(ProcessingStatus.TRANSCRIBING);
     try {
-      // Verificação de tamanho para alertar o usuário preventivamente
-      if (blob.size > 20 * 1024 * 1024) {
-        throw new Error("Arquivo de áudio muito grande para a API. Tente gravar em partes menores.");
-      }
+      if (blob.size < 1000) throw new Error("A gravação parece estar vazia.");
+
+      // SALVA LOCALMENTE NO INDEXEDDB ANTES DE TENTAR IA (Segurança dos dados)
+      await saveAudioLocal(noteId, blob);
 
       const transcription = await transcribeAudio(blob);
       setProcessingStatus(ProcessingStatus.SUMMARIZING);
       const summary = await summarizeText(transcription);
       
       const newNote: Note = {
-        id: Date.now().toString(),
+        id: noteId,
         title: `Nota ${new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`,
         date: new Date().toLocaleDateString('pt-BR'),
         durationFormatted: formatTime(recordingDuration),
@@ -132,7 +186,20 @@ const App: React.FC = () => {
       setView(AppView.EDIT);
     } catch (error: any) {
       console.error("Erro no processamento:", error);
-      alert(`Erro no processamento: ${error.message || "Falha na conexão com a IA"}`);
+      alert(`O áudio foi salvo no seu celular, mas a IA falhou ao processar: ${error.message}`);
+      
+      // Mesmo com erro na IA, criamos uma nota básica para não perder o áudio salvo
+      const partialNote: Note = {
+        id: noteId,
+        title: `Gravação Salva Localmente`,
+        date: new Date().toLocaleDateString('pt-BR'),
+        durationFormatted: formatTime(recordingDuration),
+        transcription: "Erro no processamento da IA. O áudio está disponível para ouvir.",
+        summary: "Não foi possível gerar o resumo.",
+        tags: [],
+        audioUrl
+      };
+      setNotes(prev => [partialNote, ...prev]);
       setView(AppView.LIST);
     } finally {
       setProcessingStatus(ProcessingStatus.IDLE);
@@ -149,10 +216,17 @@ const App: React.FC = () => {
     document.body.removeChild(link);
   };
 
-  const deleteNote = (id: string) => {
-    if (confirm("Deseja realmente excluir esta nota?")) {
+  const deleteNote = async (id: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    if (confirm("Deseja realmente excluir esta gravação do seu celular?")) {
+      // Remove do IndexedDB
+      await deleteAudioLocal(id);
+      // Remove do Estado
       setNotes(prev => prev.filter(n => n.id !== id));
-      setView(AppView.LIST);
+      if (activeNote?.id === id) {
+        setActiveNote(null);
+        setView(AppView.LIST);
+      }
     }
   };
 
@@ -210,7 +284,13 @@ const App: React.FC = () => {
 
   if (view === AppView.RECORD) {
     return (
-      <div className="h-full bg-slate-950 flex flex-col items-center justify-center p-8 text-center safe-top safe-bottom">
+      <div className="h-full bg-slate-950 flex flex-col items-center justify-center p-8 text-center safe-top safe-bottom relative overflow-hidden">
+        {processingStatus === ProcessingStatus.IDLE && (
+          <button onClick={cancelRecording} className="absolute top-10 left-8 p-4 bg-slate-900/50 rounded-2xl text-slate-500 hover:text-white transition-all active:scale-95">
+            <X className="w-6 h-6" />
+          </button>
+        )}
+
         <div className="w-full max-w-md flex flex-col items-center gap-10">
           {processingStatus !== ProcessingStatus.IDLE ? (
             <div className="flex flex-col items-center gap-8 animate-in fade-in zoom-in duration-500">
@@ -222,7 +302,7 @@ const App: React.FC = () => {
                 <p className="text-3xl font-black text-white tracking-tight drop-shadow-md">Processando...</p>
                 <div className="bg-slate-900/50 px-6 py-2 rounded-full border border-cyan-500/20">
                   <p className="text-cyan-400 font-bold tracking-[0.15em] uppercase text-xs">
-                    {processingStatus === ProcessingStatus.TRANSCRIBING ? "IA Transcrevendo Áudio" : "Gerando Resumo Inteligente"}
+                    {processingStatus === ProcessingStatus.TRANSCRIBING ? "Salvando e Transcrevendo" : "Gerando Resumo Inteligente"}
                   </p>
                 </div>
               </div>
@@ -230,13 +310,10 @@ const App: React.FC = () => {
           ) : (
             <>
               <div className="relative">
-                {/* Efeito de Ondas de Pulso */}
                 <div className="absolute inset-0 bg-red-500/10 blur-3xl rounded-full animate-pulse scale-[1.8]" />
                 <div className="absolute inset-0 bg-red-500/5 blur-2xl rounded-full animate-pulse delay-150 scale-[1.4]" />
-                
                 <div className="w-64 h-64 rounded-full bg-slate-900/30 backdrop-blur-3xl border-[6px] border-red-500/10 flex items-center justify-center relative z-10 overflow-hidden shadow-[0_0_80px_rgba(239,68,68,0.15)]">
                    <div className="absolute inset-0 bg-gradient-to-br from-red-500/10 via-transparent to-transparent"></div>
-                   {/* Animação de círculo externo pulsante */}
                    <div className="absolute w-full h-full border-2 border-red-500/30 rounded-full animate-ping opacity-20"></div>
                    <Mic className="w-24 h-24 text-red-500 relative z-10 drop-shadow-[0_0_15px_rgba(239,68,68,0.5)]" />
                 </div>
@@ -244,27 +321,20 @@ const App: React.FC = () => {
 
               <div className="flex flex-col items-center gap-8 w-full">
                 <div className="space-y-2">
-                  <span className="text-8xl font-mono font-black text-white tracking-tighter tabular-nums drop-shadow-2xl block">
-                    {formatTime(recordingDuration)}
-                  </span>
+                  <span className="text-8xl font-mono font-black text-white tracking-tighter tabular-nums drop-shadow-2xl block">{formatTime(recordingDuration)}</span>
                   <div className="flex items-center justify-center gap-2">
                     <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div>
-                    <p className="text-red-500 font-black uppercase tracking-[0.4em] text-[10px] opacity-80">Gravando Agora</p>
+                    <p className="text-red-500 font-black uppercase tracking-[0.4em] text-[10px] opacity-80">Gravando Localmente</p>
                   </div>
                 </div>
-                
-                <div className="w-full max-w-[300px] h-20 bg-slate-900/20 rounded-2xl p-2 border border-white/5">
-                  <Waveform isRecording={isRecording} />
+                <div className="w-full max-w-[300px] h-20 bg-slate-900/20 rounded-2xl p-2 border border-white/5 overflow-hidden">
+                  <Waveform isRecording={isRecording} stream={activeStream} />
                 </div>
-
-                <button 
-                  onClick={stopRecording}
-                  className="mt-6 w-full h-20 bg-gradient-to-r from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600 text-white rounded-[28px] font-black text-xl flex items-center justify-center gap-4 transition-all shadow-2xl shadow-red-900/50 active:scale-95 group"
-                >
+                <button onClick={stopRecording} className="mt-6 w-full h-20 bg-gradient-to-r from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600 text-white rounded-[28px] font-black text-xl flex items-center justify-center gap-4 transition-all shadow-2xl shadow-red-900/50 active:scale-95 group">
                   <div className="w-10 h-10 bg-white/10 rounded-xl flex items-center justify-center group-hover:bg-white/20 transition-colors">
                     <StopCircle className="w-7 h-7" />
                   </div>
-                  Parar Gravação
+                  Parar e Salvar
                 </button>
               </div>
             </>
@@ -294,29 +364,17 @@ const App: React.FC = () => {
         <div className="flex-1 overflow-y-auto px-4 py-6 space-y-6 pb-40 scrollbar-hide">
           {activeNote.audioUrl && (
             <div className="bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 p-5 rounded-3xl flex items-center gap-5 shadow-inner">
-              <button 
-                onClick={togglePlayback}
-                className="w-14 h-14 bg-blue-600 hover:bg-blue-500 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-blue-500/20 transition-all active:scale-90"
-              >
+              <button onClick={togglePlayback} className="w-14 h-14 bg-blue-600 hover:bg-blue-500 rounded-2xl flex items-center justify-center text-white shadow-lg shadow-blue-500/20 transition-all active:scale-90">
                 {isPlaying ? <Pause className="w-7 h-7" /> : <Play className="w-7 h-7 fill-current ml-1" />}
               </button>
               <div className="flex-1">
-                <div className="text-[10px] text-slate-500 uppercase font-black tracking-widest mb-1">Preview de Voz</div>
+                <div className="text-[10px] text-slate-500 uppercase font-black tracking-widest mb-1">Áudio do Dispositivo</div>
                 <div className="text-base font-bold text-slate-100">{activeNote.durationFormatted}</div>
               </div>
-              <button 
-                onClick={downloadAudio}
-                className="p-4 bg-slate-800/50 rounded-2xl text-slate-400 hover:text-cyan-400 hover:bg-slate-800 transition-all"
-                title="Salvar áudio localmente"
-              >
+              <button onClick={downloadAudio} className="p-4 bg-slate-800/50 rounded-2xl text-slate-400 hover:text-cyan-400 hover:bg-slate-800 transition-all">
                 <Download className="w-6 h-6" />
               </button>
-              <audio 
-                ref={audioRef} 
-                src={activeNote.audioUrl} 
-                onEnded={() => setIsPlaying(false)}
-                hidden 
-              />
+              <audio ref={audioRef} src={activeNote.audioUrl} onEnded={() => setIsPlaying(false)} hidden />
             </div>
           )}
 
@@ -326,17 +384,13 @@ const App: React.FC = () => {
                 <div className="w-8 h-8 rounded-lg bg-cyan-500/10 flex items-center justify-center">
                   <Sparkles className="w-4 h-4 text-cyan-400" />
                 </div>
-                <h3 className="text-slate-100 text-sm font-bold">Resumo da Inteligência Artificial</h3>
+                <h3 className="text-slate-100 text-sm font-bold">Resumo da IA</h3>
               </div>
               <button onClick={() => copyToClipboard(activeNote.summary, 's')} className="text-slate-500 hover:text-white p-2 bg-slate-800/30 rounded-lg">
                 {copiedSection === 's' ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
               </button>
             </div>
-            <textarea 
-              value={activeNote.summary}
-              onChange={e => setActiveNote({...activeNote, summary: e.target.value})}
-              className="w-full h-56 bg-transparent text-slate-300 leading-relaxed outline-none resize-none text-sm font-medium scrollbar-hide"
-            />
+            <textarea value={activeNote.summary} onChange={e => setActiveNote({...activeNote, summary: e.target.value})} className="w-full h-56 bg-transparent text-slate-300 leading-relaxed outline-none resize-none text-sm font-medium scrollbar-hide" />
           </div>
 
           <div className="bg-slate-900/20 p-6 rounded-[32px] border border-slate-900 space-y-5">
@@ -351,20 +405,16 @@ const App: React.FC = () => {
                 {copiedSection === 't' ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
               </button>
             </div>
-            <textarea 
-              value={activeNote.transcription}
-              onChange={e => setActiveNote({...activeNote, transcription: e.target.value})}
-              className="w-full h-80 bg-transparent text-slate-500 text-xs leading-relaxed outline-none resize-none italic"
-            />
+            <textarea value={activeNote.transcription} onChange={e => setActiveNote({...activeNote, transcription: e.target.value})} className="w-full h-80 bg-transparent text-slate-500 text-xs leading-relaxed outline-none resize-none italic" />
           </div>
         </div>
 
         <div className="fixed bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-slate-950 via-slate-950/95 to-transparent flex gap-3 safe-bottom z-50">
           <Button variant="secondary" onClick={exportPDF} className="flex-1 bg-slate-900 border-slate-800 py-4.5 rounded-2xl text-white">
-            <FileText className="w-5 h-5" /> Exportar PDF
+            <FileText className="w-5 h-5" /> PDF
           </Button>
           <Button variant="primary" onClick={saveNote} className="flex-[1.5] bg-blue-600 py-4.5 rounded-2xl shadow-xl shadow-blue-500/20">
-            <Save className="w-5 h-5" /> Salvar Nota
+            <Save className="w-5 h-5" /> Finalizar Nota
           </Button>
         </div>
       </div>
@@ -377,25 +427,16 @@ const App: React.FC = () => {
         <div className="flex justify-between items-center">
           <Logo />
           <div className="flex items-center gap-3">
-             <button className="p-3 bg-slate-900/50 rounded-2xl text-slate-400">
-               <History className="w-5 h-5" />
-             </button>
-             <div className="w-11 h-11 rounded-2xl bg-slate-800 flex items-center justify-center text-slate-400 font-bold border border-slate-700">
-               AD
-             </div>
+             <button className="p-3 bg-slate-900/50 rounded-2xl text-slate-400"><History className="w-5 h-5" /></button>
+             <div className="w-11 h-11 rounded-2xl bg-slate-800 flex items-center justify-center text-slate-400 font-bold border border-slate-700">AD</div>
           </div>
         </div>
 
         <div className="space-y-1">
-          <p className="text-slate-500 text-xs font-bold uppercase tracking-widest">{notes.length} gravações salvas</p>
+          <p className="text-slate-500 text-xs font-bold uppercase tracking-widest">{notes.length} arquivos no dispositivo</p>
           <div className="relative group">
             <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-600 group-focus-within:text-cyan-500 transition-colors" />
-            <input 
-              placeholder="Pesquisar reuniões, ideias..."
-              value={searchQuery}
-              onChange={e => setSearchQuery(e.target.value)}
-              className="w-full bg-slate-900/40 border border-slate-800/50 rounded-[20px] py-4.5 pl-12 pr-4 text-sm focus:border-cyan-500/30 focus:bg-slate-900/60 outline-none transition-all text-white backdrop-blur-sm"
-            />
+            <input placeholder="Pesquisar..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)} className="w-full bg-slate-900/40 border border-slate-800/50 rounded-[20px] py-4.5 pl-12 pr-4 text-sm focus:border-cyan-500/30 focus:bg-slate-900/60 outline-none transition-all text-white backdrop-blur-sm" />
           </div>
         </div>
       </header>
@@ -403,29 +444,20 @@ const App: React.FC = () => {
       <div className="flex-1 overflow-y-auto px-6 space-y-4 pb-36 scrollbar-hide">
         {filteredNotes.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-[50vh] text-slate-600 text-center gap-6">
-            <div className="relative">
-              <div className="absolute inset-0 bg-blue-500/5 blur-3xl rounded-full"></div>
-              <div className="p-10 bg-slate-900/30 rounded-[40px] border border-slate-800/50 relative z-10">
-                <Mic className="w-14 h-14 text-slate-700" />
-              </div>
+            <div className="p-10 bg-slate-900/30 rounded-[40px] border border-slate-800/50 relative z-10">
+              <Mic className="w-14 h-14 text-slate-700" />
             </div>
-            <div className="space-y-2 max-w-[240px]">
-              <p className="font-bold text-slate-300 text-lg">Sem gravações</p>
-              <p className="text-sm leading-relaxed text-slate-500 font-medium">Toque no botão abaixo para começar a capturar suas reuniões com IA.</p>
-            </div>
+            <p className="text-sm leading-relaxed text-slate-500 font-medium">Toque no botão para gravar uma reunião.</p>
           </div>
         ) : (
           filteredNotes.map(note => (
-            <NoteCard key={note.id} note={note} onClick={() => { setActiveNote(note); setView(AppView.EDIT); }} />
+            <NoteCard key={note.id} note={note} onClick={() => { setActiveNote(note); setView(AppView.EDIT); }} onDelete={(e) => deleteNote(note.id, e)} />
           ))
         )}
       </div>
 
       <div className="fixed bottom-10 right-8 z-50">
-        <button 
-          onClick={startRecording}
-          className="h-18 w-18 bg-gradient-to-br from-cyan-400 to-blue-600 rounded-[24px] shadow-2xl shadow-blue-500/40 flex items-center justify-center text-white active:scale-90 transition-all hover:scale-105 active:rotate-12"
-        >
+        <button onClick={startRecording} className="h-18 w-18 bg-gradient-to-br from-cyan-400 to-blue-600 rounded-[24px] shadow-2xl shadow-blue-500/40 flex items-center justify-center text-white active:scale-90 transition-all hover:scale-105">
           <Plus className="w-9 h-9" />
         </button>
       </div>

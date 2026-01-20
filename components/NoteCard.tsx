@@ -1,10 +1,12 @@
+
 import React from 'react';
-import { Clock, ChevronRight, FileAudio, Users, Lightbulb, CheckSquare } from 'lucide-react';
+import { Clock, ChevronRight, FileAudio, Users, Lightbulb, CheckSquare, Trash2 } from 'lucide-react';
 import { Note } from '../types';
 
 interface NoteCardProps {
   note: Note;
   onClick: () => void;
+  onDelete: (e: React.MouseEvent) => void;
 }
 
 const getNoteIcon = (note: Note) => {
@@ -22,16 +24,16 @@ const getNoteIcon = (note: Note) => {
   return FileAudio;
 };
 
-export const NoteCard: React.FC<NoteCardProps> = ({ note, onClick }) => {
+export const NoteCard: React.FC<NoteCardProps> = ({ note, onClick, onDelete }) => {
   const Icon = getNoteIcon(note);
 
   return (
     <div 
       onClick={onClick}
-      className="group bg-slate-900/50 backdrop-blur-sm p-4 rounded-2xl border border-slate-800 hover:border-cyan-500/30 hover:bg-slate-800 transition-all duration-300 cursor-pointer shadow-lg shadow-black/20"
+      className="group bg-slate-900/50 backdrop-blur-sm p-4 rounded-2xl border border-slate-800 hover:border-cyan-500/30 hover:bg-slate-800 transition-all duration-300 cursor-pointer shadow-lg shadow-black/20 relative"
     >
       <div className="flex justify-between items-start mb-3">
-        <div className="flex items-center gap-3 overflow-hidden">
+        <div className="flex items-center gap-3 overflow-hidden pr-8">
           <div className="p-2 rounded-lg bg-slate-800 group-hover:bg-cyan-500/10 transition-colors shrink-0">
             <Icon className="w-5 h-5 text-cyan-500" />
           </div>
@@ -39,7 +41,13 @@ export const NoteCard: React.FC<NoteCardProps> = ({ note, onClick }) => {
             {note.title}
           </h3>
         </div>
-        <ChevronRight className="w-5 h-5 text-slate-600 group-hover:text-cyan-400 transition-colors mt-2 shrink-0" />
+        <button 
+          onClick={onDelete}
+          className="p-2 text-slate-600 hover:text-red-500 hover:bg-red-500/10 rounded-xl transition-all shrink-0"
+          title="Excluir gravação"
+        >
+          <Trash2 className="w-4.5 h-4.5" />
+        </button>
       </div>
       
       <div className="flex items-center gap-3 text-xs text-slate-400 mb-3 font-medium pl-1">
